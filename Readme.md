@@ -229,5 +229,5 @@ Version 1.0, 2025.
 
 ---
 
-**Author:** Collaborative work between researchers and AI systems  
+**Author:** JJL and GP 
 **License:** MIT (free for academic and commercial use)
