@@ -114,120 +114,86 @@ class SpectrumSimulator:
     seed: Optional[int] = None
 
     def simulate(
-        self,
-        x: ArrayLike,
-        peaks: Iterable[Peak],
-        baseline: Optional[Callable[[np.ndarray], np.ndarray]] = None,
-        noise: Optional[NoiseConfig] = None,
-        irf_fwhm: Optional[float] = None,
-        drift_ppm: float = 0.0,
-        return_components: bool = True,
-    ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
-        """Generate a synthetic spectrum.
+            self,
+            x: ArrayLike,
+            peaks: Iterable[Peak],
+            baseline: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+            noise: Optional[NoiseConfig] = None,
+            irf_fwhm: Optional[float] = None,
+            drift_ppm: float = 0.0,
+            peak_jitter_std: float = 0.0,         # 新增：峰位随机漂移（单位同x）
+            groupwise_jitter: bool = False,       # 新增：若True，同组peak共用同一漂移
+            return_components: bool = True,
+        ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
 
-        Parameters
-        ----------
-        x : array-like
-            Wavenumber axis (cm^-1) or wavelength/time axis; must be sorted.
-        peaks : iterable of Peak
-            Collection of peak definitions.
-        baseline : callable x->y, optional
-            Function returning baseline at x. Use BaselinePreset.* helpers.
-        noise : NoiseConfig, optional
-            Noise parameters. If None, no noise added.
-        irf_fwhm : float, optional
-            Instrument resolution (FWHM) for Gaussian convolution (applied to signal+baseline before noise).
-        drift_ppm : float, default 0.0
-            Global axis drift in parts-per-million (positive shifts peaks to higher x).
-        return_components : bool
-            If True, return dict with components for analysis.
+            x = np.asarray(x, dtype=float)
+            rng = np.random.default_rng(self.seed)
 
-        Returns
-        -------
-        y : ndarray
-            Final simulated spectrum.
-        parts : dict
-            Components: 'axis', 'signal', 'baseline', 'convolved', 'noise', 'final'.
-        """
-        rng = np.random.default_rng(self.seed)
-        x = np.asarray(x, dtype=float)
-        if x.ndim != 1:
-            raise ValueError("x must be 1D array")
+            # Apply drift in ppm (axis scaling)
+            x_eff = x * (1.0 + drift_ppm * 1e-6)
 
-        # Apply global drift (ppm)
-        x_eff = x * (1.0 + drift_ppm * 1e-6)
+            # Sum peaks
+            signal = np.zeros_like(x_eff)
+            if peaks:
+                group_shift = {}
+                if groupwise_jitter and peak_jitter_std > 0:
+                    for pk in peaks:
+                        if pk.group not in group_shift:
+                            group_shift[pk.group] = rng.normal(0.0, peak_jitter_std)
+                for pk in peaks:
+                    shift = 0.0
+                    if peak_jitter_std > 0:
+                        if groupwise_jitter:
+                            shift = group_shift.get(pk.group, 0.0)
+                        else:
+                            shift = rng.normal(0.0, peak_jitter_std)
+                    signal += Peak(
+                        pos=pk.pos + shift,
+                        height=pk.height,
+                        fwhm=pk.fwhm,
+                        shape=pk.shape,
+                        eta=pk.eta
+                    ).profile(x_eff)
 
-        # Sum peak profiles
-        signal = np.zeros_like(x_eff)
-        for pk in peaks:
-            signal += pk.profile(x_eff)
+            # Baseline
+            base = baseline(x) if baseline is not None else np.zeros_like(x)
 
-        base = baseline(x_eff) if baseline is not None else np.zeros_like(x_eff)
-        raw = signal + base
+            # IRF convolution
+            convolved = signal + base
+            if irf_fwhm and irf_fwhm > 0:
+                sigma = irf_fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+                dx = np.median(np.diff(x))
+                half_width = int(np.ceil(4 * sigma / dx))
+                grid = np.arange(-half_width, half_width + 1) * dx
+                kernel = np.exp(-0.5 * (grid / sigma) ** 2)
+                kernel /= kernel.sum()
+                convolved = np.convolve(convolved, kernel, mode="same")
 
-        # Convolve with Gaussian IRF if provided
-        if irf_fwhm and irf_fwhm > 0:
-            sigma = irf_fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
-            dx = np.median(np.diff(x_eff))
-            # kernel length ~ +/- 4 sigma
-            half_width = int(np.ceil(4 * sigma / dx))
-            grid = np.arange(-half_width, half_width + 1) * dx
-            kernel = np.exp(-0.5 * (grid / sigma) ** 2)
-            kernel /= kernel.sum()
-            convolved = np.convolve(raw, kernel, mode='same')
-        else:
-            convolved = raw.copy()
+            y = np.copy(convolved)
 
-        y = convolved.copy()
-        noise_vec = np.zeros_like(y)
+            # Noise
+            if noise is not None:
+                if noise.multiplicative_sigma and noise.multiplicative_sigma > 0:
+                    y *= (1.0 + rng.normal(0.0, noise.multiplicative_sigma, size=y.shape))
+                if noise.gaussian_sigma and noise.gaussian_sigma > 0:
+                    y += rng.normal(0.0, noise.gaussian_sigma, size=y.shape)
+                if noise.poisson_scale is not None and noise.poisson_scale > 0:
+                    counts = np.clip(y * noise.poisson_scale, 0, None)
+                    y = rng.poisson(counts).astype(float) / noise.poisson_scale
 
-        if noise is not None:
-            # multiplicative noise (proportional)
-            if noise.multiplicative_sigma and noise.multiplicative_sigma > 0:
-                y *= (1.0 + rng.normal(0.0, noise.multiplicative_sigma, size=y.size))
+            parts = {
+                'axis': x,
+                'axis_eff': x_eff,
+                'signal': signal,
+                'baseline': base,
+                'convolved': convolved,
+                'noise': y - convolved,
+                'final': y,
+                'coords': {'r': x},
+            } if return_components else {}
 
-            # additive Gaussian noise
-            if noise.gaussian_sigma and noise.gaussian_sigma > 0:
-                noise_vec += rng.normal(0.0, noise.gaussian_sigma, size=y.size)
+            return y, parts
 
-            # Poisson / shot noise: convert to counts with scaling, then back
-            if noise.poisson_scale is not None and noise.poisson_scale > 0:
-                counts = np.clip(y * noise.poisson_scale, 0, None)
-                # Use normal approximations for large counts to keep speed; otherwise rng.poisson
-                # Here, directly sample Poisson for generality
-                counts_noisy = rng.poisson(counts)
-                y = counts_noisy.astype(float) / noise.poisson_scale
-
-            # 1/f noise via colored noise in frequency domain
-            if noise.one_over_f_strength and noise.one_over_f_strength > 0:
-                one_over_f = colored_noise_1overf(rng, y.size, noise.one_over_f_strength)
-                noise_vec += one_over_f
-
-            # Random spikes (cosmic rays)
-            if noise.spike_rate and noise.spike_rate > 0:
-                n_spikes = rng.binomial(y.size, min(max(noise.spike_rate, 0.0), 1.0))
-                if n_spikes > 0:
-                    idx = rng.choice(y.size, size=n_spikes, replace=False)
-                    # local std estimate using robust MAD
-                    local_std = _robust_std(y)
-                    heights = rng.uniform(noise.spike_height[0], noise.spike_height[1], size=n_spikes)
-                    y[idx] += heights * local_std
-
-            # finally add additive components accumulated in noise_vec
-            y = y + noise_vec
-
-        parts = {
-            'axis': x,
-            'axis_eff': x_eff,
-            'signal': signal,
-            'baseline': base,
-            'convolved': convolved,
-            'noise': y - convolved,
-            'final': y,
-            'coords': {'r': x},
-        } if return_components else {}
-
-        return y, parts
 
 # -------------------- Peak shape functions --------------------
 def gaussian(x: np.ndarray, mu: float, fwhm: float, height: float) -> np.ndarray:
