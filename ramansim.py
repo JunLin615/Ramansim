@@ -49,6 +49,7 @@ class Peak:
     fwhm: float = 10.0           # full width at half max (same units as axis)
     shape: str = 'gaussian'      # 'gaussian' | 'lorentzian' | 'pvoigt'
     eta: float = 0.5             # mixing for pvoigt (0=Gaussian, 1=Lorentzian)
+    group: Optional[str] = None  # optional group tag; peaks with same group can share correlated jitter
 
     def profile(self, x: np.ndarray) -> np.ndarray:
         if self.shape == 'gaussian':
@@ -114,86 +115,138 @@ class SpectrumSimulator:
     seed: Optional[int] = None
 
     def simulate(
-            self,
-            x: ArrayLike,
-            peaks: Iterable[Peak],
-            baseline: Optional[Callable[[np.ndarray], np.ndarray]] = None,
-            noise: Optional[NoiseConfig] = None,
-            irf_fwhm: Optional[float] = None,
-            drift_ppm: float = 0.0,
-            peak_jitter_std: float = 0.0,         # 新增：峰位随机漂移（单位同x）
-            groupwise_jitter: bool = False,       # 新增：若True，同组peak共用同一漂移
-            return_components: bool = True,
-        ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+        self,
+        x: ArrayLike,
+        peaks: Iterable[Peak],
+        baseline: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+        noise: Optional[NoiseConfig] = None,
+        irf_fwhm: Optional[float] = None,
+        drift_ppm: float = 0.0,
+        peak_jitter_std: float = 0.0,
+        groupwise_jitter: bool = False,
+        anomalies: Optional['AnomalyConfig'] = None,
+        return_components: bool = True,
+    ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+        """Generate a synthetic spectrum.
 
-            x = np.asarray(x, dtype=float)
-            rng = np.random.default_rng(self.seed)
+        Parameters
+        ----------
+        x : array-like
+            Wavenumber axis (cm^-1) or wavelength/time axis; must be sorted.
+        peaks : iterable of Peak
+            Collection of peak definitions.
+        baseline : callable x->y, optional
+            Function returning baseline at x. Use BaselinePreset.* helpers.
+        noise : NoiseConfig, optional
+            Noise parameters. If None, no noise added.
+        irf_fwhm : float, optional
+            Instrument resolution (FWHM) for Gaussian convolution (applied to signal+baseline before noise).
+        drift_ppm : float, default 0.0
+            Global axis drift in parts-per-million (positive shifts peaks to higher x).
+        return_components : bool
+            If True, return dict with components for analysis.
 
-            # Apply drift in ppm (axis scaling)
-            x_eff = x * (1.0 + drift_ppm * 1e-6)
+        Returns
+        -------
+        y : ndarray
+            Final simulated spectrum.
+        parts : dict
+            Components: 'axis', 'signal', 'baseline', 'convolved', 'noise', 'final'.
+        """
+        rng = np.random.default_rng(self.seed)
+        x = np.asarray(x, dtype=float)
+        if x.ndim != 1:
+            raise ValueError("x must be 1D array")
 
-            # Sum peaks
-            signal = np.zeros_like(x_eff)
-            if peaks:
-                group_shift = {}
-                if groupwise_jitter and peak_jitter_std > 0:
-                    for pk in peaks:
-                        if pk.group not in group_shift:
-                            group_shift[pk.group] = rng.normal(0.0, peak_jitter_std)
+        # Apply global drift (ppm)
+        x_eff = x * (1.0 + drift_ppm * 1e-6)
+
+        # Sum peaks with optional jitter
+        signal = np.zeros_like(x_eff)
+        if peaks:
+            group_shift: Dict[Optional[str], float] = {}
+            if groupwise_jitter and peak_jitter_std > 0:
                 for pk in peaks:
-                    shift = 0.0
-                    if peak_jitter_std > 0:
-                        if groupwise_jitter:
-                            shift = group_shift.get(pk.group, 0.0)
-                        else:
-                            shift = rng.normal(0.0, peak_jitter_std)
-                    signal += Peak(
-                        pos=pk.pos + shift,
-                        height=pk.height,
-                        fwhm=pk.fwhm,
-                        shape=pk.shape,
-                        eta=pk.eta
-                    ).profile(x_eff)
+                    key = getattr(pk, 'group', None)
+                    if key not in group_shift:
+                        group_shift[key] = rng.normal(0.0, peak_jitter_std)
+            for pk in peaks:
+                shift = 0.0
+                if peak_jitter_std > 0:
+                    if groupwise_jitter:
+                        shift = group_shift.get(getattr(pk, 'group', None), 0.0)
+                    else:
+                        shift = rng.normal(0.0, peak_jitter_std)
+                signal += Peak(pos=pk.pos + shift, height=pk.height, fwhm=pk.fwhm, shape=pk.shape, eta=pk.eta).profile(x_eff)
 
-            # Baseline
-            base = baseline(x) if baseline is not None else np.zeros_like(x)
+        # Baseline
+        x_base = x_eff  # use drifted axis for baseline evaluation
+        base = baseline(x_base) if baseline is not None else np.zeros_like(x_base)
+        raw = signal + base
 
-            # IRF convolution
-            convolved = signal + base
-            if irf_fwhm and irf_fwhm > 0:
-                sigma = irf_fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
-                dx = np.median(np.diff(x))
-                half_width = int(np.ceil(4 * sigma / dx))
-                grid = np.arange(-half_width, half_width + 1) * dx
-                kernel = np.exp(-0.5 * (grid / sigma) ** 2)
-                kernel /= kernel.sum()
-                convolved = np.convolve(convolved, kernel, mode="same")
+        # Convolve with Gaussian IRF if provided
+        if irf_fwhm and irf_fwhm > 0:
+            sigma = irf_fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
+            dx = np.median(np.diff(x_eff))
+            # kernel length ~ +/- 4 sigma
+            half_width = int(np.ceil(4 * sigma / dx))
+            grid = np.arange(-half_width, half_width + 1) * dx
+            kernel = np.exp(-0.5 * (grid / sigma) ** 2)
+            kernel /= kernel.sum()
+            convolved = np.convolve(raw, kernel, mode='same')
+        else:
+            convolved = raw.copy()
 
-            y = np.copy(convolved)
+        y = convolved.copy()
+        noise_vec = np.zeros_like(y)
 
-            # Noise
-            if noise is not None:
-                if noise.multiplicative_sigma and noise.multiplicative_sigma > 0:
-                    y *= (1.0 + rng.normal(0.0, noise.multiplicative_sigma, size=y.shape))
-                if noise.gaussian_sigma and noise.gaussian_sigma > 0:
-                    y += rng.normal(0.0, noise.gaussian_sigma, size=y.shape)
-                if noise.poisson_scale is not None and noise.poisson_scale > 0:
-                    counts = np.clip(y * noise.poisson_scale, 0, None)
-                    y = rng.poisson(counts).astype(float) / noise.poisson_scale
+        if noise is not None:
+            # multiplicative noise (proportional)
+            if noise.multiplicative_sigma and noise.multiplicative_sigma > 0:
+                y *= (1.0 + rng.normal(0.0, noise.multiplicative_sigma, size=y.size))
 
-            parts = {
-                'axis': x,
-                'axis_eff': x_eff,
-                'signal': signal,
-                'baseline': base,
-                'convolved': convolved,
-                'noise': y - convolved,
-                'final': y,
-                'coords': {'r': x},
-            } if return_components else {}
+            # additive Gaussian noise
+            if noise.gaussian_sigma and noise.gaussian_sigma > 0:
+                noise_vec += rng.normal(0.0, noise.gaussian_sigma, size=y.size)
 
-            return y, parts
+            # Poisson / shot noise: convert to counts with scaling, then back
+            if noise.poisson_scale is not None and noise.poisson_scale > 0:
+                counts = np.clip(y * noise.poisson_scale, 0, None)
+                # Use normal approximations for large counts to keep speed; otherwise rng.poisson
+                # Here, directly sample Poisson for generality
+                counts_noisy = rng.poisson(counts)
+                y = counts_noisy.astype(float) / noise.poisson_scale
 
+            # 1/f noise via colored noise in frequency domain
+            if noise.one_over_f_strength and noise.one_over_f_strength > 0:
+                one_over_f = colored_noise_1overf(rng, y.size, noise.one_over_f_strength)
+                noise_vec += one_over_f
+
+            # Random spikes (cosmic rays)
+            if noise.spike_rate and noise.spike_rate > 0:
+                n_spikes = rng.binomial(y.size, min(max(noise.spike_rate, 0.0), 1.0))
+                if n_spikes > 0:
+                    idx = rng.choice(y.size, size=n_spikes, replace=False)
+                    # local std estimate using robust MAD
+                    local_std = _robust_std(y)
+                    heights = rng.uniform(noise.spike_height[0], noise.spike_height[1], size=n_spikes)
+                    y[idx] += heights * local_std
+
+            # finally add additive components accumulated in noise_vec
+            y = y + noise_vec
+
+        parts = {
+            'axis': x,
+            'axis_eff': x_eff,
+            'signal': signal,
+            'baseline': base,
+            'convolved': convolved,
+            'noise': y - convolved,
+            'final': y,
+            'coords': {'r': x},
+        } if return_components else {}
+
+        return y, parts
 
 # -------------------- Peak shape functions --------------------
 def gaussian(x: np.ndarray, mu: float, fwhm: float, height: float) -> np.ndarray:
@@ -522,10 +575,410 @@ def save_maps_to_h5(path: str, iterator, n_samples: int, ny: Optional[int]=None,
         for i, (cube, aux) in enumerate(iterator, start=1):
             dset[i] = cube
 
-# -------------------- Extra ideas (to implement later) --------------------
-# - Baseline drift over time for time-series acquisitions
-# - Laser power fluctuations across scans
-# - Saturation / clipping effects
-# - SERS-specific variability models (log-normal random enhancement factors per-peak)
-# - Calibration errors (axis nonlinearity), and pixel binning
-# - API to draw peak sets from external spectral libraries (files)
+# -------------------- Statistical generators & validity masks --------------------
+
+@dataclass
+class VariationSpec:
+    """Statistical variation spec for peak heights across samples.
+
+    kind: 'std' | 'range' | 'rel_range' | 'cv'
+    value: float (interpretation depends on kind)
+    clip_min: float = 0.0  # minimum allowed sampled height
+    distribution: str = 'auto'  # 'auto' | 'normal' | 'uniform' | 'lognormal'
+    """
+    kind: str
+    value: float
+    clip_min: float = 0.0
+    distribution: str = 'auto'
+
+
+def _sample_heights(rng: np.random.Generator, base: np.ndarray, spec: VariationSpec) -> np.ndarray:
+    b = np.asarray(base, dtype=float)
+    if spec.kind == 'std':
+        std = float(spec.value)
+        if spec.distribution in ('auto','normal'):
+            h = b + rng.normal(0.0, std, size=b.shape)
+        else:
+            # match std for uniform: std = w/sqrt(12) => w = std*sqrt(12)
+            w = std * np.sqrt(12.0)
+            h = b + rng.uniform(-w/2, w/2, size=b.shape)
+    elif spec.kind == 'range':
+        w = float(spec.value)
+        h = b + rng.uniform(-w/2, w/2, size=b.shape)
+    elif spec.kind == 'rel_range':
+        rr = float(spec.value)
+        h = b * (1.0 + rng.uniform(-rr/2, rr/2, size=b.shape))
+    elif spec.kind == 'cv':
+        # lognormal with desired coefficient of variation: cv = sqrt(exp(s^2)-1)
+        cv = max(float(spec.value), 1e-12)
+        sigma = np.sqrt(np.log(cv*cv + 1.0))
+        mu = np.log(np.maximum(b, 1e-12)) - 0.5 * sigma * sigma
+        h = rng.lognormal(mean=mu, sigma=sigma, size=b.shape)
+    else:
+        raise ValueError(f"Unknown VariationSpec.kind: {spec.kind}")
+    if spec.clip_min is not None:
+        h = np.clip(h, spec.clip_min, None)
+    return h
+
+
+def generate_spectra_n(sim: SpectrumSimulator,
+                        x: ArrayLike,
+                        peaks_template: List[Peak],
+                        n: int,
+                        height_spec: Optional[VariationSpec] = None,
+                        peak_jitter_std: float = 0.0,
+                        groupwise_jitter: bool = False,
+                        seed0: Optional[int] = None,
+                        **simulate_kwargs) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    """Generate N single spectra with statistical variation in peak heights.
+
+    Returns Y of shape (n, len(x)) and dict with 'heights' (n, n_peaks) used.
+    Additional simulate() kwargs (baseline, noise, irf_fwhm, drift_ppm, ...) are supported.
+    """
+    x = np.asarray(x, dtype=float)
+    rng = np.random.default_rng(seed0 if seed0 is not None else sim.seed)
+    Y = []
+    H = []
+    base_heights = np.array([pk.height for pk in peaks_template], dtype=float)
+    for i in range(n):
+        if height_spec is not None:
+            h_i = _sample_heights(rng, base_heights, height_spec)
+        else:
+            h_i = base_heights.copy()
+        H.append(h_i)
+        peaks_i = [
+            Peak(
+                pos=pk.pos,
+                height=float(h_i[j]),
+                fwhm=pk.fwhm,
+                shape=pk.shape,
+                eta=pk.eta,
+                group=getattr(pk, 'group', None)
+            )
+            for j, pk in enumerate(peaks_template)
+        ]
+        y, _ = sim.simulate(x, peaks=peaks_i, peak_jitter_std=peak_jitter_std, groupwise_jitter=groupwise_jitter,
+                            return_components=False, **simulate_kwargs)
+        Y.append(y)
+    Y = np.stack(Y, axis=0)
+    H = np.stack(H, axis=0)
+    return Y, {'heights': H, 'coords': {'r': x}}
+
+@dataclass
+class ValidityMaskConfig:
+    proportion_valid: float = 0.5   # fraction of pixels/frames with valid analyte signal
+    mode: str = 'independent'       # 'independent' | 'gaussian_clusters' | 'smooth_field'
+    n_clusters: int = 3             # for cluster mode
+    cluster_std: float = 4.0        # pixels
+    smooth_sigma: float = 6.0       # for smooth_field
+    seed: Optional[int] = None
+
+
+def _threshold_to_proportion(rng: np.random.Generator, field: np.ndarray, p: float) -> np.ndarray:
+    # choose threshold so that proportion of field>th equals ~p
+    flat = field.ravel()
+    k = max(1, int(np.floor((1.0 - p) * flat.size)))
+    thr = np.partition(flat, k)[k]
+    return (field > thr).astype(bool)
+
+
+def make_validity_mask_2d(cfg: ValidityMaskConfig, ny: int, nx: int) -> np.ndarray:
+    rng = np.random.default_rng(cfg.seed)
+    p = np.clip(cfg.proportion_valid, 0.0, 1.0)
+    if cfg.mode == 'independent':
+        mask = rng.random((ny, nx)) < p
+    elif cfg.mode == 'gaussian_clusters':
+        field = np.zeros((ny, nx), dtype=float)
+        for _ in range(max(cfg.n_clusters,1)):
+            cy = rng.uniform(0, ny-1)
+            cx = rng.uniform(0, nx-1)
+            y = np.arange(ny)[:, None]
+            x = np.arange(nx)[None, :]
+            field += np.exp(-0.5 * (((y - cy)**2 + (x - cx)**2) / (cfg.cluster_std**2 + 1e-9)))
+        field = (field - field.min()) / (field.max() - field.min() + 1e-12)
+        mask = _threshold_to_proportion(rng, field, p)
+    elif cfg.mode == 'smooth_field':
+        raw = rng.random((ny, nx))
+        field = _gaussian_blur2d(raw, sigma=cfg.smooth_sigma)
+        field = (field - field.min()) / (field.max() - field.min() + 1e-12)
+        mask = _threshold_to_proportion(rng, field, p)
+    else:
+        raise ValueError(f"Unknown validity mode: {cfg.mode}")
+    return mask
+
+
+def make_validity_mask_1d(cfg: ValidityMaskConfig, n: int) -> np.ndarray:
+    rng = np.random.default_rng(cfg.seed)
+    p = np.clip(cfg.proportion_valid, 0.0, 1.0)
+    if cfg.mode == 'independent':
+        return rng.random(n) < p
+    elif cfg.mode == 'smooth_field':
+        raw = rng.random(n)
+        # 1D Gaussian blur via convolution
+        sigma = max(cfg.smooth_sigma, 1.0)
+        radius = int(np.ceil(4 * sigma))
+        x = np.arange(-radius, radius+1)
+        k = np.exp(-0.5 * (x/sigma)**2)
+        k /= k.sum()
+        field = np.convolve(raw, k, mode='same')
+        field = (field - field.min()) / (field.max() - field.min() + 1e-12)
+        thr = np.partition(field, max(1, int(np.floor((1.0 - p) * n))))[max(1, int(np.floor((1.0 - p) * n)))]
+        return field > thr
+    else:
+        # treat gaussian_clusters same as smooth_field in 1D
+        return make_validity_mask_1d(ValidityMaskConfig(proportion_valid=p, mode='smooth_field', smooth_sigma=cfg.smooth_sigma, seed=cfg.seed), n)
+
+
+def simulate_map2d_with_validity(spectrum_sim: SpectrumSimulator,
+                                 x: ArrayLike,
+                                 analytes: List[List[Peak]],
+                                 analyte_weights: List[float],
+                                 cfg: MapConfig,
+                                 validity: ValidityMaskConfig,
+                                 baseline: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+                                 noise: Optional[NoiseConfig] = None,
+                                 irf_fwhm: Optional[float] = None,
+                                 drift_ppm: float = 0.0) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    """Simulate a map where only a given proportion of pixels carry valid analyte signal.
+    Invalid pixels contain baseline+noise only.
+    """
+    mapsim = MapSimulator(spectrum_sim)
+    # full (signal+baseline+noise)
+    cube_sig, aux = mapsim.simulate_map2d(x, analytes, analyte_weights, None, cfg, baseline, noise, irf_fwhm, drift_ppm)
+    # baseline+noise only
+    cube_bg, _ = mapsim.simulate_map2d(x, analytes=[], analyte_weights=[], per_analyte_fields=None, cfg=cfg, baseline=baseline, noise=noise, irf_fwhm=irf_fwhm, drift_ppm=drift_ppm)
+    ny, nx, _ = cube_sig.shape
+    mask = make_validity_mask_2d(validity, ny, nx)
+    mask3 = mask[:, :, None].astype(float)
+    cube = mask3 * cube_sig + (1.0 - mask3) * cube_bg
+    aux['valid_mask'] = mask
+    return cube, aux
+
+
+def simulate_time_series(sim: SpectrumSimulator,
+                         x: ArrayLike,
+                         peaks_template: List[Peak],
+                         N: int,
+                         validity: Optional[ValidityMaskConfig] = None,
+                         height_spec: Optional[VariationSpec] = None,
+                         baseline_fn: Optional[Callable[[np.ndarray, int, int], np.ndarray]] = None,
+                         noise: Optional[NoiseConfig] = None,
+                         irf_fwhm: Optional[float] = None,
+                         drift_ppm_fn: Optional[Callable[[int, int], float]] = None,
+                         peak_jitter_std: float = 0.0,
+                         groupwise_jitter: bool = False,
+                         seed0: Optional[int] = None) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    """Simulate a time series of N spectra with optional validity mask (per-frame),
+    height variation, baseline/drift schedules.
+    baseline_fn(x, i, N) -> baseline array for frame i
+    drift_ppm_fn(i, N) -> drift ppm for frame i
+    """
+    rng = np.random.default_rng(seed0 if seed0 is not None else sim.seed)
+    x = np.asarray(x, dtype=float)
+    n_pts = x.size
+    # validity mask over time
+    if validity is not None:
+        mask_t = make_validity_mask_1d(validity, N)
+    else:
+        mask_t = np.ones(N, dtype=bool)
+    # base heights
+    base_heights = np.array([pk.height for pk in peaks_template], dtype=float)
+    Y = np.zeros((N, n_pts), dtype=float)
+    meta = {'valid_mask_t': mask_t, 'coords': {'r': x}}
+    for i in range(N):
+        # heights
+        if height_spec is not None:
+            h_i = _sample_heights(rng, base_heights, height_spec)
+        else:
+            h_i = base_heights
+        peaks_i = [
+            Peak(
+                pos=pk.pos,
+                height=float(h_i[j]),
+                fwhm=pk.fwhm,
+                shape=pk.shape,
+                eta=pk.eta,
+                group=getattr(pk, 'group', None)
+            )
+            for j, pk in enumerate(peaks_template)
+        ]
+        # baseline schedule
+        base = None
+        if baseline_fn is not None:
+            base = lambda xx, i=i: baseline_fn(xx, i, N)
+        # drift schedule
+        dppm = drift_ppm_fn(i, N) if drift_ppm_fn is not None else 0.0
+        # simulate signal or baseline+noise only
+        if mask_t[i]:
+            y, _ = sim.simulate(x, peaks=peaks_i, baseline=base, noise=noise, irf_fwhm=irf_fwhm,
+                                drift_ppm=dppm, peak_jitter_std=peak_jitter_std, groupwise_jitter=groupwise_jitter,
+                                return_components=False)
+        else:
+            y, _ = sim.simulate(x, peaks=[], baseline=base, noise=noise, irf_fwhm=irf_fwhm,
+                                drift_ppm=dppm, return_components=False)
+        Y[i, :] = y
+    return Y, meta
+
+# -------------------- Advanced statistical & anomaly utilities --------------------
+
+@dataclass
+class CorrelatedHeightSpec:
+    distribution: str  # 'mvnormal' | 'mvlognormal'
+    mean: np.ndarray   # (P,)
+    cov: np.ndarray    # (P,P)
+
+
+def sample_correlated_heights(rng: np.random.Generator, spec: CorrelatedHeightSpec) -> np.ndarray:
+    if spec.distribution == 'mvnormal':
+        return rng.multivariate_normal(mean=np.asarray(spec.mean), cov=np.asarray(spec.cov))
+    elif spec.distribution == 'mvlognormal':
+        z = rng.multivariate_normal(mean=np.asarray(spec.mean), cov=np.asarray(spec.cov))
+        return np.exp(z)
+    else:
+        raise ValueError("distribution must be 'mvnormal' or 'mvlognormal'")
+
+
+def generate_spectra_n_correlated(sim: SpectrumSimulator,
+                                   x: ArrayLike,
+                                   peaks_template: List[Peak],
+                                   n: int,
+                                   corr_spec: CorrelatedHeightSpec,
+                                   peak_jitter_std: float = 0.0,
+                                   groupwise_jitter: bool = False,
+                                   seed0: Optional[int] = None,
+                                   **simulate_kwargs) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    """Generate N spectra using a multivariate (log)normal for peak heights.
+    Returns (Y, meta) where Y shape is (n, len(x)) and meta['heights'] stores sampled heights.
+    """
+    x = np.asarray(x, dtype=float)
+    rng = np.random.default_rng(seed0 if seed0 is not None else sim.seed)
+    P = len(peaks_template)
+    Y, H = [], []
+    for _ in range(n):
+        h = sample_correlated_heights(rng, corr_spec)
+        if h.shape[0] != P:
+            raise ValueError("CorrelatedHeightSpec length must equal number of peaks")
+        H.append(h)
+        peaks_i = [Peak(pos=pk.pos, height=float(h[j]), fwhm=pk.fwhm, shape=pk.shape, eta=pk.eta, group=getattr(pk,'group',None))
+                   for j, pk in enumerate(peaks_template)]
+        y, _ = sim.simulate(x, peaks=peaks_i, peak_jitter_std=peak_jitter_std, groupwise_jitter=groupwise_jitter,
+                            return_components=False, **simulate_kwargs)
+        Y.append(y)
+    return np.stack(Y,0), {'heights': np.stack(H,0), 'coords': {'r': x}}
+
+# -------------------- Heteroscedastic noise (post-processing) --------------------
+
+def apply_heteroscedastic_gaussian(y: np.ndarray,
+                                   ref: Union[float, np.ndarray],
+                                   base_sigma: float,
+                                   scale: float = 0.0,
+                                   power: float = 1.0,
+                                   seed: Optional[int] = None) -> np.ndarray:
+    """Add Gaussian noise with sigma = base_sigma * (1 + scale * ref**power)."""
+    rng = np.random.default_rng(seed)
+    if np.isscalar(ref):
+        eff = base_sigma * (1.0 + scale * (ref ** power))
+        return y + rng.normal(0.0, eff, size=y.shape)
+    ref = np.asarray(ref)
+    eff = base_sigma * (1.0 + scale * (np.maximum(ref,0.0) ** power))
+    return y + rng.normal(0.0, 1.0, size=y.shape) * eff
+
+# -------------------- Anomalies & contamination (post-processing) --------------------
+
+@dataclass
+class AnomalyConfig:
+    spurious_peak_rate: float = 0.0                    # expected count per spectrum = rate * n_points
+    spurious_fwhm_range: Tuple[float,float] = (5.0,20.0)
+    spurious_height_range: Tuple[float,float] = (0.2,1.0)
+    saturation_level: Optional[float] = None          # clip upper bound
+    axis_warp_quad: float = 0.0                       # simple quadratic warp coefficient
+
+
+def inject_spurious_peaks(x: np.ndarray, y: np.ndarray, cfg: AnomalyConfig, seed: Optional[int]=None) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    n = len(x)
+    n_spur = rng.poisson(n * max(cfg.spurious_peak_rate, 0.0))
+    out = y.copy()
+    for _ in range(n_spur):
+        p = rng.uniform(x.min(), x.max())
+        f = rng.uniform(*cfg.spurious_fwhm_range)
+        h = rng.uniform(*cfg.spurious_height_range)
+        out += gaussian(x, p, f, h)
+    return out
+
+
+def apply_axis_warp(x: np.ndarray, y: np.ndarray, quad: float) -> np.ndarray:
+    if quad == 0.0:
+        return y
+    xc = (x - x.mean()) / (x.ptp() + 1e-12)
+    xw = x + quad * (xc**2) * x.ptp()
+    return np.interp(x, xw, y, left=y[0], right=y[-1])
+
+
+def apply_saturation(y: np.ndarray, level: Optional[float]) -> np.ndarray:
+    if level is None:
+        return y
+    return np.clip(y, None, level)
+
+# -------------------- Map validity + anomalies wrapper --------------------
+
+@dataclass
+class AnomalyMapConfig:
+    bad_pixel_rate: float = 0.0
+    seed: Optional[int] = None
+
+
+def simulate_map2d_with_validity_and_anomalies(spectrum_sim: SpectrumSimulator,
+                                               x: ArrayLike,
+                                               analytes: List[List[Peak]],
+                                               analyte_weights: List[float],
+                                               cfg: MapConfig,
+                                               validity: 'ValidityMaskConfig',
+                                               baseline: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+                                               noise: Optional['NoiseConfig'] = None,
+                                               irf_fwhm: Optional[float] = None,
+                                               drift_ppm: float = 0.0,
+                                               anomalies: Optional[AnomalyMapConfig] = None) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    cube, aux = simulate_map2d_with_validity(spectrum_sim, x, analytes, analyte_weights, cfg, validity, baseline, noise, irf_fwhm, drift_ppm)
+    if anomalies is not None and anomalies.bad_pixel_rate > 0.0:
+        ny, nx, _ = cube.shape
+        rng = np.random.default_rng(anomalies.seed)
+        bad = rng.random((ny, nx)) < anomalies.bad_pixel_rate
+        cube[bad, :] = np.nan
+        aux['bad_mask'] = bad
+    return cube, aux
+
+# -------------------- Label noise & domain shift helpers --------------------
+
+def corrupt_labels(labels: np.ndarray, prob: float, num_classes: int, seed: Optional[int] = None) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    labels = np.asarray(labels).copy()
+    mask = rng.random(labels.shape) < prob
+    noisy = labels.copy()
+    rand = rng.integers(0, num_classes, size=mask.sum())
+    noisy[mask] = rand
+    return noisy
+
+
+def make_domain_shift_configs(map_cfg: MapConfig,
+                              valid_cfg: 'ValidityMaskConfig',
+                              train_delta: Dict[str, float],
+                              test_delta: Dict[str, float]) -> Tuple[MapConfig, 'ValidityMaskConfig', MapConfig, 'ValidityMaskConfig']:
+    """Return (map_train, valid_train, map_test, valid_test) after applying parameter deltas.
+    Supported keys (if present): 'variability','cluster_std','smooth_sigma' on map; 'proportion_valid' on validity.
+    """
+    def adjust_map(cfg: MapConfig, d: Dict[str,float]) -> MapConfig:
+        c = MapConfig(**{**cfg.__dict__})
+        for k,v in d.items():
+            if hasattr(c, k):
+                setattr(c, k, getattr(c,k) + v)
+        return c
+    def adjust_valid(cfg: 'ValidityMaskConfig', d: Dict[str,float]) -> 'ValidityMaskConfig':
+        c = ValidityMaskConfig(**{**cfg.__dict__})
+        for k,v in d.items():
+            if hasattr(c, k):
+                setattr(c, k, getattr(c,k) + v)
+        return c
+    return adjust_map(map_cfg, train_delta), adjust_valid(valid_cfg, train_delta), adjust_map(map_cfg, test_delta), adjust_valid(valid_cfg, test_delta)
+
+# -------------------- End of advanced utilities --------------------

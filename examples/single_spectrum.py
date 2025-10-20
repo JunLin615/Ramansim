@@ -18,7 +18,7 @@ peaks = peaks_from_arrays([612, 1000, 1580], heights=[1.0, 0.6, 0.9], fwhms=[12,
 
 sim = SpectrumSimulator(seed=42)
 noise = NoiseConfig(gaussian_sigma=0.02, poisson_scale=1500, one_over_f_strength=0.005,
-spike_rate=0.0005, spike_height=(3,8), multiplicative_sigma=0.01)
+                    spike_rate=0.0005, spike_height=(3,8), multiplicative_sigma=0.01)
 baseline = BaselinePreset.graphite_like(intensity=0.2, center=1580, fwhm=250, offset=0.02, slope=2e-4)
 
 
