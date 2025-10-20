@@ -319,27 +319,28 @@ class MapConfig:
     # ---- coordinate systems (optional) ----
     x_coords: Optional[np.ndarray] = None   # length nx; if None -> np.arange(nx)
     y_coords: Optional[np.ndarray] = None   # length ny; if None -> np.arange(ny)
-    t_coords: Optional[np.ndarray] = None   # optional time/frame axis for future extensionsclass MapSimulator:
+    t_coords: Optional[np.ndarray] = None   # optional time/frame axis for future extensions
+
+
+class MapSimulator:
     """Simulate 1D/2D Raman mapping datasets (data cubes).
 
-    Core idea: define per-pixel abundance/scale fields for peak groups ("analytes").
-    Each analyte is a set of peaks that scale together. Spatial fields can be
-    uncorrelated random, clustered via Gaussian blobs, or smoothly varying fields
-    (e.g., due to morphology, thickness, hotspots).
+    Core idea:
+      - Each analyte corresponds to a set of peaks (same analyte → correlated intensity).
+      - A spatial abundance field is generated for each analyte.
+      - The spectrum at each pixel is the weighted sum of analyte spectra + baseline + noise.
 
     Returns
     -------
     cube : ndarray, shape (ny, nx, n_points)
         Simulated Raman map.
-    aux : dict with keys
-        - 'fields': (A, ny, nx) abundance fields per analyte
-        - 'unit_spec': (A, n_points) unit spectra per analyte
-        - 'coords': dict with
-            'r' : Raman shift axis (same as input x)
-            'x' : spatial x axis (len nx; pixel indices if not provided)
-            'y' : spatial y axis (len ny; pixel indices if not provided)
-            't' : optional time axis (or None)
+    aux : dict
+        Includes:
+          'fields' : (A, ny, nx) abundance fields per analyte
+          'unit_spec' : (A, n_points) unit spectra per analyte
+          'coords' : {'r','x','y','t'} coordinate arrays
     """
+
     def __init__(self, spectrum_sim: SpectrumSimulator):
         self.spectrum_sim = spectrum_sim
 
@@ -350,70 +351,69 @@ class MapConfig:
         elif cfg.cluster_mode == 'gaussian_clusters':
             field = np.zeros((ny, nx), dtype=float)
             for _ in range(max(cfg.n_clusters, 1)):
-                cy = rng.uniform(0, ny-1)
-                cx = rng.uniform(0, nx-1)
+                cy = rng.uniform(0, ny - 1)
+                cx = rng.uniform(0, nx - 1)
                 y = np.arange(ny)[:, None]
                 x = np.arange(nx)[None, :]
                 field += np.exp(-0.5 * (((y - cy) ** 2 + (x - cx) ** 2) / (cfg.cluster_std ** 2 + 1e-9)))
-            # normalize to 0..1
             field = (field - field.min()) / (field.max() - field.min() + 1e-12)
         elif cfg.cluster_mode == 'smooth_field':
-            # start random, then blur with Gaussian kernel (separable)
             raw = rng.random((ny, nx))
             field = _gaussian_blur2d(raw, sigma=cfg.smooth_sigma)
             field = (field - field.min()) / (field.max() - field.min() + 1e-12)
         else:
             raise ValueError(f"Unknown cluster_mode: {cfg.cluster_mode}")
-        # add variability and base offset
         field = (1.0 - cfg.variability) + cfg.variability * field
         return field
 
-    def simulate_map2d(self,
-                       x: ArrayLike,
-                       analytes: List[List[Peak]],
-                       analyte_weights: Optional[List[float]] = None,
-                       per_analyte_fields: Optional[List[np.ndarray]] = None,
-                       cfg: Optional[MapConfig] = None,
-                       baseline: Optional[Callable[[np.ndarray], np.ndarray]] = None,
-                       noise: Optional[NoiseConfig] = None,
-                       irf_fwhm: Optional[float] = None,
-                       drift_ppm: float = 0.0) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
-        """Return a data cube of shape (ny, nx, n_points)."""
+    def simulate_map2d(
+        self,
+        x: ArrayLike,
+        analytes: List[List[Peak]],
+        analyte_weights: Optional[List[float]] = None,
+        per_analyte_fields: Optional[List[np.ndarray]] = None,
+        cfg: Optional[MapConfig] = None,
+        baseline: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+        noise: Optional[NoiseConfig] = None,
+        irf_fwhm: Optional[float] = None,
+        drift_ppm: float = 0.0
+    ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+
         x = np.asarray(x, dtype=float)
-        ny, nx = (cfg.ny, cfg.nx) if cfg is not None else (16, 16)
+        ny, nx = (cfg.ny, cfg.nx) if cfg else (16, 16)
         cfg = cfg or MapConfig(ny=ny, nx=nx)
-        # coordinates (defaults to pixel indices)
+        rng = np.random.default_rng(cfg.seed if cfg.seed is not None else self.spectrum_sim.seed)
+
+        # Coordinate axes
         x_coords = cfg.x_coords if cfg.x_coords is not None else np.arange(nx)
         y_coords = cfg.y_coords if cfg.y_coords is not None else np.arange(ny)
-        t_coords = cfg.t_coords  # may be None
-        rng = np.random.default_rng(cfg.seed if cfg.seed is not None else self.spectrum_sim.seed)
+        t_coords = cfg.t_coords
+
         n_pts = x.size
         n_analytes = len(analytes)
         if analyte_weights is None:
             analyte_weights = [1.0] * n_analytes
         if per_analyte_fields is None:
             per_analyte_fields = [self._make_field(cfg, rng) for _ in range(n_analytes)]
-        # stack for vectorization
-        fields = np.stack(per_analyte_fields, axis=0)  # (A, ny, nx)
+        fields = np.stack(per_analyte_fields, axis=0)
         cube = np.zeros((ny, nx, n_pts), dtype=float)
-        # precompute analyte spectra at unit weight (no baseline/noise), then scale per pixel
+
+        # Precompute unit spectra
         unit_spec = []
         for pkset in analytes:
             y0, _ = self.spectrum_sim.simulate(x, peaks=pkset, baseline=None, noise=None,
                                                irf_fwhm=irf_fwhm, drift_ppm=drift_ppm,
                                                return_components=False)
             unit_spec.append(y0)
-        unit_spec = np.stack(unit_spec, axis=0)  # (A, n_pts)
-        # compose per pixel
+        unit_spec = np.stack(unit_spec, axis=0)
+
         for iy in range(ny):
             for ix in range(nx):
-                mix = (fields[:, iy, ix] * np.asarray(analyte_weights))
+                mix = fields[:, iy, ix] * np.asarray(analyte_weights)
                 y_no_base = (mix[:, None] * unit_spec).sum(axis=0)
                 y, parts = self.spectrum_sim.simulate(x, peaks=[], baseline=baseline, noise=noise,
                                                        irf_fwhm=None, drift_ppm=0.0, return_components=True)
-                # inject composed signal before baseline/noise
                 convolved = y_no_base + parts['baseline']
-                # apply IRF if requested
                 if irf_fwhm and irf_fwhm > 0:
                     sigma = irf_fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))
                     dx = np.median(np.diff(x))
@@ -423,44 +423,28 @@ class MapConfig:
                     kernel /= kernel.sum()
                     convolved = np.convolve(convolved, kernel, mode='same')
                 y_final = convolved
-                # apply noise at the end using SpectrumSimulator's noise path
                 if noise is not None:
-                    # reuse simulate with a dummy convolved curve
-                    parts_dummy = parts
-                    parts_dummy['convolved'] = convolved
-                    y_final = convolved.copy()
-                    # additive/multiplicative noise
-                    rng_local = np.random.default_rng(cfg.seed + iy*nx + ix if cfg.seed is not None else None)
-                    # multiplicative
+                    rng_local = np.random.default_rng(cfg.seed + iy * nx + ix if cfg.seed is not None else None)
                     if noise.multiplicative_sigma and noise.multiplicative_sigma > 0:
                         y_final *= (1.0 + rng_local.normal(0.0, noise.multiplicative_sigma, size=n_pts))
-                    # Gaussian
                     if noise.gaussian_sigma and noise.gaussian_sigma > 0:
                         y_final += rng_local.normal(0.0, noise.gaussian_sigma, size=n_pts)
-                    # Poisson
                     if noise.poisson_scale is not None and noise.poisson_scale > 0:
                         counts = np.clip(y_final * noise.poisson_scale, 0, None)
                         y_final = rng_local.poisson(counts).astype(float) / noise.poisson_scale
                 cube[iy, ix, :] = y_final
+
         aux = {
-            'fields': fields,              # (A, ny, nx) abundance fields per analyte
-            'unit_spec': unit_spec,        # (A, n_pts) unit spectra per analyte
-            'coords': {
-                'r': x,
-                'x': x_coords,
-                'y': y_coords,
-                't': t_coords,
-            }
+            'fields': fields,
+            'unit_spec': unit_spec,
+            'coords': {'r': x, 'x': x_coords, 'y': y_coords, 't': t_coords}
         }
         return cube, aux
 
     def simulate_map1d(self, *args, **kwargs) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
-        """1D line scan as a degenerate 2D map with ny=1."""
         cfg = kwargs.get('cfg', None)
         if cfg is None:
             kwargs['cfg'] = MapConfig(ny=1, nx=kwargs.get('nx', 128))
-        else:
-            kwargs['cfg'] = MapConfig(ny=1, nx=cfg.nx, **{k: v for k, v in cfg.__dict__.items() if k not in ['ny']})
         cube, aux = self.simulate_map2d(*args, **kwargs)
         line = cube[0, :, :]
         if 'coords' in aux:
