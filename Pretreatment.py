@@ -1285,7 +1285,15 @@ class SpectralLabelingApp:
             entry.pack(side='left', fill='x', expand=True, padx=4)
             tk.Button(row, text='标记', command=lambda i=idx: self.apply_label_from_entry(i)).pack(side='left', padx=(4, 0))
             self.label_entries.append(entry)
-
+            
+        all_row = tk.Frame(control_frame)
+        all_row.pack(fill='x', pady=(12, 6))
+        tk.Label(all_row, text='全部标签:', width=7, anchor='w').pack(side='left')
+        self.all_label_entry = tk.Entry(all_row)
+        self.all_label_entry.insert(0, defaults[0])
+        self.all_label_entry.pack(side='left', fill='x', expand=True, padx=4)
+        tk.Button(all_row, text='全部标记', command=self.apply_label_to_all).pack(side='left', padx=(4, 0))
+        
         nav_frame = tk.Frame(control_frame)
         nav_frame.pack(fill='x', pady=(18, 8))
         tk.Button(nav_frame, text='上一条', command=self.go_previous).pack(side='left', fill='x', expand=True)
@@ -1352,7 +1360,20 @@ class SpectralLabelingApp:
         if self.current_index < self.n_spectra - 1:
             self.current_index += 1
         self.update_plot()
+    def apply_label_to_all(self):
+        label = self._clean_label(self.all_label_entry.get())
+        if label == 'U':
+            if not messagebox.askyesno(
+                '确认全部标记',
+                '你输入的全部标签为空或无效，将把全部光谱标记为 U。\n是否继续？',
+                parent=self.master,
+            ):
+                return
 
+        self.labels = [label] * self.n_spectra
+        self.current_index = 0
+        self.current_label_var.set(label)
+        self.finish_labeling()
     def go_previous(self):
         if self.current_index > 0:
             self.current_index -= 1
@@ -1391,7 +1412,7 @@ if __name__ == "__main__" :
 
 
     # 定义文件路径
-    file_path = 'D:/北工博士阶段/论文冲冲冲/LIG-EDAg-LINE-SERS/AI/conc_txt/0.5_xy0.txt'
+    file_path = 'data/1M_1s_1x1.txt'
 
     #result1 = read_conc(file_path)
     data_array = read_Raman(file_path)
