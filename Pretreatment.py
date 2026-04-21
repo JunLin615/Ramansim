@@ -7,7 +7,7 @@ Created on Sun Oct 15 22:32:53 2023
 """
 
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, simpledialog
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 import pandas as pd
@@ -429,23 +429,97 @@ class WitecRamanProcessor:
         except Exception:
             pass
 
-    def read_data(self, file_path, delimiter='\t'):
+    def _try_read_manual_marked_data(self, file_path, delimiter='	'):
+        """
+        识别并读取“手工标记后的物理数据 / 自标记后的物理数据 / 循环自标记后的物理数据”。
+        文件结构：
+        第1行：富光谱级标签（仅第一列有效）
+        第2行：逐光谱标签
+        第3行：逐光谱置信度
+        第4行：列名（第一列为波数字段名，后续列为xy字符串）
+        第5行起：波数 + 强度矩阵
+        """
+        try:
+            raw = pd.read_csv(file_path, delimiter=delimiter or '	', header=None, dtype=str, keep_default_na=False)
+        except Exception:
+            return None
+
+        if raw.shape[0] < 5 or raw.shape[1] < 2:
+            return None
+
+        row0_tail = [str(x).strip() for x in raw.iloc[0, 1:].tolist()]
+        conf_tail = pd.to_numeric(raw.iloc[2, 1:], errors='coerce')
+        wavelength_tail = pd.to_numeric(raw.iloc[4:, 0], errors='coerce')
+
+        row0_blank_ratio = sum(x == '' for x in row0_tail) / max(1, len(row0_tail))
+        conf_numeric_ratio = conf_tail.notna().sum() / max(1, len(conf_tail))
+        wavelength_numeric_ratio = wavelength_tail.notna().sum() / max(1, len(wavelength_tail))
+
+        if row0_blank_ratio < 0.7 or conf_numeric_ratio < 0.7 or wavelength_numeric_ratio < 0.9:
+            return None
+
+        header_row = raw.iloc[3, :].tolist()
+        column_names = []
+        for i, value in enumerate(header_row[1:], start=1):
+            value = str(value).strip()
+            column_names.append(value if value else f'Spec{i}')
+
+        wavelengths = pd.to_numeric(raw.iloc[4:, 0], errors='coerce').reset_index(drop=True)
+        spectral_data = raw.iloc[4:, 1:].apply(pd.to_numeric, errors='coerce').reset_index(drop=True)
+        spectral_data.columns = column_names
+
+        self._last_read_info = {
+            'delimiter_used': delimiter or '	',
+            'has_header': True,
+            'ncols': int(spectral_data.shape[1] + 1),
+            'manual_marked_format': True,
+        }
+        self._last_manual_label_bundle = {
+            'file_label': str(raw.iloc[0, 0]).strip() or 'U',
+            'spectrum_labels': [str(x).strip() or 'U' for x in raw.iloc[1, 1:].tolist()],
+            'confidences': [float(x) if str(x).strip() not in ('', 'nan', 'None') else 1.0 for x in raw.iloc[2, 1:].tolist()],
+            'position_headers': column_names,
+            'wavelength_header': str(raw.iloc[3, 0]).strip() or 'wave',
+        }
+        return wavelengths, spectral_data
+
+    def read_data(self, file_path, delimiter='	'):
         """
         读取高光谱数据。
 
+        兼容两类txt：
+        1. 普通预处理后的物理数据：第一列波数，后续列为各条光谱。
+        2. 手工/自/循环标记后的物理数据：前4行为标签与元数据，第5行起为波数和强度矩阵。
+
         Backward compatible behavior:
-        - compat_mode=False (default): uses pandas read_csv with the given delimiter (legacy behavior).
-        - compat_mode=True: if delimiter is None, auto-sniff delimiter and auto-detect header (when header_mode='auto').
+        - compat_mode=False (default): 默认保持原有读取习惯，但现在会优先自动识别_MM等标记格式。
+        - compat_mode=True: 在delimiter=None时自动探测分隔符，并可在header_mode='auto'时自动判断表头。
         """
-        # Legacy path: keep behavior unchanged
+        manual = None
+        if delimiter is None:
+            try_delims = ['	', ',', ';']
+        else:
+            try_delims = [delimiter]
+
+        for d in try_delims:
+            manual = self._try_read_manual_marked_data(file_path, delimiter=d)
+            if manual is not None:
+                return manual
+
         if not getattr(self, 'compat_mode', False):
-            data = pd.read_csv(file_path, delimiter=delimiter)
+            used_delim = delimiter if delimiter is not None else '	'
+            data = pd.read_csv(file_path, delimiter=used_delim)
+            self._last_read_info = {
+                'delimiter_used': used_delim,
+                'has_header': True,
+                'ncols': int(data.shape[1]),
+                'manual_marked_format': False,
+            }
+            self._last_manual_label_bundle = None
             wavelengths = data.iloc[:, 0]
             spectral_data = data.iloc[:, 1:]
             return wavelengths, spectral_data
 
-        # Compat path
-        # 1) Read a few non-empty lines for robust delimiter sniffing (avoid header traps)
         lines = []
         try:
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
@@ -472,14 +546,10 @@ class WitecRamanProcessor:
                     pass
             return ok / max(1, len(tokens))
 
-        # choose a "data-like" line for delimiter sniffing:
-        # - skip the very first non-empty line (often header)
-        # - prefer lines where most tokens are numeric
         candidate_lines = lines[1:] if len(lines) >= 2 else lines[:]
         data_line = None
         for s in candidate_lines:
-            # Try common splits for judging numeric-ness
-            for split_kind in ('\t', ',', ';', 'whitespace'):
+            for split_kind in ('	', ',', ';', 'whitespace'):
                 toks = (re.split(r'\s+', s) if split_kind == 'whitespace' else s.split(split_kind))
                 toks = [x.strip() for x in toks if x.strip() != '']
                 if len(toks) >= 2 and _floatable_ratio(toks) >= 0.8:
@@ -488,32 +558,25 @@ class WitecRamanProcessor:
             if data_line is not None:
                 break
 
-        # fallback if we didn't find a numeric-like data line: use 2nd non-empty line if possible
         if data_line is None:
             data_line = candidate_lines[0] if candidate_lines else lines[0]
 
-        # 2) Decide delimiter:
-        # rule: prefer '\t' unless it obviously doesn't work; only then sniff others
         used_delim = delimiter
         if used_delim is None:
-            # Try tab first
-            tab_cols = len(data_line.split('\t'))
+            tab_cols = len(data_line.split('	'))
             if tab_cols >= 2:
-                used_delim = '\t'
+                used_delim = '	'
             else:
                 used_delim = self._sniff_delimiter(data_line)
 
         if used_delim is None:
             raise ValueError('delimiter_unknown')
 
-        # 3) Decide header: use the *first* non-empty line as header candidate,
-        # but delimiter judgement comes from data_line.
         first_line = lines[0]
         has_header = True
         if getattr(self, 'header_mode', 'legacy') == 'auto':
             has_header = self._detect_header(first_line, used_delim)
 
-        # 4) Build pandas read_csv args
         read_kwargs = {}
         if used_delim == 'whitespace':
             read_kwargs['sep'] = r'\s+'
@@ -522,10 +585,8 @@ class WitecRamanProcessor:
             read_kwargs['delimiter'] = used_delim
 
         read_kwargs['header'] = 0 if has_header else None
-
         data = pd.read_csv(file_path, **read_kwargs)
 
-        # If no header, assign default column names
         if not has_header:
             ncols = data.shape[1]
             if ncols < 2:
@@ -533,16 +594,16 @@ class WitecRamanProcessor:
             cols = ['X-Axis'] + [f'Spec{i}' for i in range(1, ncols)]
             data.columns = cols
 
-        # Basic validation
         if data.shape[1] < 2:
             raise ValueError('data_format_invalid')
 
-        # Record diagnostics for caller
         self._last_read_info = {
             'delimiter_used': used_delim,
             'has_header': bool(has_header),
             'ncols': int(data.shape[1]),
+            'manual_marked_format': False,
         }
+        self._last_manual_label_bundle = None
 
         wavelengths = data.iloc[:, 0]
         spectral_data = data.iloc[:, 1:]
@@ -974,6 +1035,66 @@ class WitecRamanProcessor:
             else:
                 self.process_file_reBaseLine(file_path)
 
+    def save_manual_marked_data(self, source_file_path, wavelengths, spectral_data,
+                                spectrum_labels=None, file_label='U', confidences=None,
+                                output_dir=None, suffix='_MM'):
+        """
+        将一个输入txt保存为“手工标记后的物理数据”格式。
+        """
+        output_dir = output_dir or self.output_dir
+        os.makedirs(output_dir, exist_ok=True)
+
+        def _clean_label(value, default='U'):
+            text = str(value).strip()
+            if text == '' or '\t' in text or '\n' in text or '\r' in text:
+                return default
+            return text
+
+            return text
+
+        n_spectra = spectral_data.shape[1]
+        if spectrum_labels is None:
+            spectrum_labels = ['U'] * n_spectra
+        if confidences is None:
+            confidences = [1.0] * n_spectra
+
+        if len(spectrum_labels) != n_spectra:
+            raise ValueError('spectrum_labels长度与光谱列数不一致')
+        if len(confidences) != n_spectra:
+            raise ValueError('confidences长度与光谱列数不一致')
+
+        file_label = _clean_label(file_label, default='U')
+        spectrum_labels = [_clean_label(x, default='U') for x in spectrum_labels]
+        confidences = [float(x) for x in confidences]
+
+        manual_bundle = getattr(self, '_last_manual_label_bundle', {}) or {}
+        wavelength_header = manual_bundle.get('wavelength_header', None)
+        if not wavelength_header:
+            wavelength_header = getattr(wavelengths, 'name', None) or 'wave'
+
+        column_names = [str(col) if str(col).strip() else f'Spec{i+1}' for i, col in enumerate(spectral_data.columns)]
+
+        base = os.path.splitext(os.path.basename(source_file_path))[0]
+        output_base = base if base.endswith(suffix) else f'{base}{suffix}'
+        output_path = os.path.join(output_dir, f'{output_base}.txt')
+
+        body = pd.concat([
+            pd.Series(wavelengths).reset_index(drop=True),
+            spectral_data.reset_index(drop=True)
+        ], axis=1)
+        body.columns = [wavelength_header] + column_names
+
+        with open(output_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f, delimiter='	')
+            writer.writerow([file_label] + [''] * n_spectra)
+            writer.writerow([''] + spectrum_labels)
+            writer.writerow([''] + [f'{x:.6g}' for x in confidences])
+            writer.writerow([wavelength_header] + column_names)
+            for row in body.itertuples(index=False, name=None):
+                writer.writerow(list(row))
+
+        return output_path
+
     def read_template(self,template_file):
         with open(template_file, 'r') as file:
             lines = file.readlines()
@@ -1039,6 +1160,232 @@ class WitecRamanProcessor:
 
 
 
+
+
+class SpectralLabelingApp:
+    """
+    手工打标界面：
+    - 一个输入txt最终输出一个对应的_MM.txt
+    - 三个可编辑标签输入框 + 对应打标按钮
+    - 上一条 / 下一条（保持U） / 完成打标
+    - 支持辅助线，用于参考目标峰位
+    - 未标记光谱默认保持为U
+    """
+    def __init__(self, master, processor, input_file, output_dir, wavelengths, spectral_data,
+                 start_wavelength=500, end_wavelength=1800,
+                 button_label_defaults=None, initial_labels=None, initial_file_label='U',
+                 mark_list=None):
+        self.master = master
+        self.processor = processor
+        self.input_file = input_file
+        self.output_dir = output_dir
+        self.wavelengths = pd.Series(wavelengths).reset_index(drop=True)
+        self.spectral_data = spectral_data.reset_index(drop=True).copy()
+        self.start_wavelength = start_wavelength
+        self.end_wavelength = end_wavelength
+        self.n_spectra = self.spectral_data.shape[1]
+        self.current_index = 0
+        self.file_label = str(initial_file_label).strip() or 'U'
+        self.saved_output_path = None
+        self.mark_list = self._normalize_mark_list(mark_list)
+
+        if self.n_spectra == 0:
+            raise ValueError('输入数据中没有可打标的光谱列。')
+
+        self.labels = ['U'] * self.n_spectra
+        if initial_labels is not None:
+            for i, value in enumerate(list(initial_labels)[:self.n_spectra]):
+                self.labels[i] = self._clean_label(value)
+        self.confidences = [1.0] * self.n_spectra
+
+        self.master.title('Manual Spectral Labeling | MM_v3')
+        self.master.geometry('1100x760')
+
+        defaults = list(button_label_defaults or ['I', 'MB', ''])
+        while len(defaults) < 3:
+            defaults.append('')
+
+        self.current_label_var = tk.StringVar(value='U')
+        self.progress_var = tk.StringVar(value='')
+        self.position_var = tk.StringVar(value='')
+
+        self._build_ui(defaults)
+        self.update_plot()
+
+    def _clean_label(self, value):
+        text = str(value).strip()
+        if text == '' or '\t' in text or '\n' in text or '\r' in text:
+            return 'U'
+        return text
+
+    def _normalize_mark_list(self, values):
+        if values is None:
+            return []
+        if isinstance(values, str):
+            raw_items = re.split(r'[,;\s]+', values.strip())
+        else:
+            raw_items = values
+        marks = []
+        for item in raw_items:
+            s = str(item).strip()
+            if not s:
+                continue
+            try:
+                marks.append(float(s))
+            except Exception:
+                continue
+        return marks
+
+    def _parse_mark_list_from_entry(self):
+        return self._normalize_mark_list(self.mark_entry.get())
+
+    def refresh_mark_lines(self):
+        self.mark_list = self._parse_mark_list_from_entry()
+        self.update_plot()
+
+    def _build_ui(self, defaults):
+        container = tk.Frame(self.master)
+        container.pack(fill='both', expand=True, padx=10, pady=10)
+
+        plot_frame = tk.Frame(container)
+        plot_frame.pack(side='left', fill='both', expand=True)
+
+        control_frame = tk.Frame(container, width=320)
+        control_frame.pack(side='right', fill='y', padx=(10, 0))
+        control_frame.pack_propagate(False)
+
+        self.fig, self.ax = plt.subplots(figsize=(8, 5))
+        self.canvas = FigureCanvasTkAgg(self.fig, master=plot_frame)
+        self.canvas.get_tk_widget().pack(fill='both', expand=True)
+
+
+        tk.Label(control_frame, text='版本：MM_v3（诊断版）', fg='blue', font=('Arial', 11, 'bold')).pack(anchor='w', pady=(0, 6))
+        tk.Label(control_frame, text='打标状态', font=('Arial', 12, 'bold')).pack(anchor='w', pady=(0, 8))
+        tk.Label(control_frame, textvariable=self.progress_var, justify='left').pack(anchor='w', pady=2)
+        tk.Label(control_frame, textvariable=self.position_var, justify='left').pack(anchor='w', pady=2)
+        tk.Label(control_frame, text='当前标签：').pack(anchor='w', pady=(12, 2))
+        tk.Label(control_frame, textvariable=self.current_label_var, fg='blue', font=('Arial', 12, 'bold')).pack(anchor='w', pady=(0, 12))
+
+        tk.Label(control_frame, text='辅助线峰位（逗号分隔）').pack(anchor='w', pady=(2, 4))
+        mark_row = tk.Frame(control_frame)
+        mark_row.pack(fill='x', pady=(0, 10))
+        self.mark_entry = tk.Entry(mark_row)
+        if self.mark_list:
+            self.mark_entry.insert(0, ', '.join(f'{x:g}' for x in self.mark_list))
+        self.mark_entry.pack(side='left', fill='x', expand=True)
+        tk.Button(mark_row, text='更新辅助线', command=self.refresh_mark_lines).pack(side='left', padx=(6, 0))
+
+        self.label_entries = []
+        for idx in range(3):
+            row = tk.Frame(control_frame)
+            row.pack(fill='x', pady=6)
+            tk.Label(row, text=f'标签{idx + 1}:', width=7, anchor='w').pack(side='left')
+            entry = tk.Entry(row)
+            entry.insert(0, defaults[idx])
+            entry.pack(side='left', fill='x', expand=True, padx=4)
+            tk.Button(row, text='标记', command=lambda i=idx: self.apply_label_from_entry(i)).pack(side='left', padx=(4, 0))
+            self.label_entries.append(entry)
+
+        nav_frame = tk.Frame(control_frame)
+        nav_frame.pack(fill='x', pady=(18, 8))
+        tk.Button(nav_frame, text='上一条', command=self.go_previous).pack(side='left', fill='x', expand=True)
+        tk.Button(nav_frame, text='下一条（保持U）', command=self.go_next).pack(side='left', fill='x', expand=True, padx=6)
+
+        tk.Button(control_frame, text='完成打标', command=self.finish_labeling, height=2).pack(fill='x', pady=(10, 0))
+        tk.Label(control_frame, text='提示：未打标或跳过的光谱会保持为 U。', justify='left', fg='gray').pack(anchor='w', pady=(12, 0))
+
+        self.master.bind('<Left>', lambda event: self.go_previous())
+        self.master.bind('<Right>', lambda event: self.go_next())
+        self.master.bind('<Return>', lambda event: self.apply_label_from_entry(0))
+
+    def _get_plot_slice(self):
+        wavelength_values = pd.to_numeric(self.wavelengths, errors='coerce').to_numpy()
+        valid_mask = np.isfinite(wavelength_values)
+        if not np.any(valid_mask):
+            return self.wavelengths, self.spectral_data.iloc[:, self.current_index]
+
+        valid_idx = np.where(valid_mask)[0]
+        start_candidates = np.where(wavelength_values >= self.start_wavelength)[0]
+        end_candidates = np.where(wavelength_values > self.end_wavelength)[0]
+        start_idx = int(start_candidates[0]) if len(start_candidates) > 0 else int(valid_idx[0])
+        end_idx = int(end_candidates[0]) if len(end_candidates) > 0 else len(wavelength_values)
+        if end_idx <= start_idx:
+            start_idx, end_idx = 0, len(wavelength_values)
+        return self.wavelengths.iloc[start_idx:end_idx], self.spectral_data.iloc[start_idx:end_idx, self.current_index]
+
+    def update_plot(self):
+        selected_wavelengths, selected_intensity = self._get_plot_slice()
+        column_label = str(self.spectral_data.columns[self.current_index])
+        current_label = self.labels[self.current_index]
+
+        self.ax.clear()
+        self.ax.plot(selected_wavelengths, selected_intensity)
+
+        ymin = float(np.nanmin(selected_intensity)) if len(selected_intensity) else 0.0
+        ymax = float(np.nanmax(selected_intensity)) if len(selected_intensity) else 1.0
+        if not np.isfinite(ymin):
+            ymin = 0.0
+        if not np.isfinite(ymax):
+            ymax = 1.0
+        if ymax <= ymin:
+            ymax = ymin + 1.0
+
+        for mark in self.mark_list:
+            self.ax.axvline(x=mark, color='r', linestyle='--', linewidth=1.0, alpha=0.8)
+            self.ax.text(mark, ymax - 0.05 * (ymax - ymin), f'{mark:g}',
+                         rotation=90, ha='right', va='top', color='r', fontsize=9)
+
+        self.ax.set_title(f'{column_label} | {self.current_index + 1}/{self.n_spectra}')
+        self.ax.set_xlabel('Raman shift (cm^-1)')
+        self.ax.set_ylabel('Intensity')
+        self.ax.grid(alpha=0.2)
+        self.canvas.draw()
+
+        self.progress_var.set(f'当前进度：{self.current_index + 1} / {self.n_spectra}')
+        self.position_var.set(f'列名/位置：{column_label}')
+        self.current_label_var.set(current_label)
+
+    def apply_label_from_entry(self, entry_index):
+        label = self._clean_label(self.label_entries[entry_index].get())
+        self.labels[self.current_index] = label
+        self.current_label_var.set(label)
+        if self.current_index < self.n_spectra - 1:
+            self.current_index += 1
+        self.update_plot()
+
+    def go_previous(self):
+        if self.current_index > 0:
+            self.current_index -= 1
+            self.update_plot()
+
+    def go_next(self):
+        if self.current_index < self.n_spectra - 1:
+            self.current_index += 1
+            self.update_plot()
+        else:
+            self.finish_labeling()
+
+    def finish_labeling(self):
+        value = simpledialog.askstring(
+            '富光谱级别标签',
+            '请输入富光谱级别标签（留空默认U）：',
+            initialvalue=self.file_label,
+            parent=self.master,
+        )
+        self.file_label = self._clean_label(value)
+        output_path = self.processor.save_manual_marked_data(
+            source_file_path=self.input_file,
+            wavelengths=self.wavelengths,
+            spectral_data=self.spectral_data,
+            spectrum_labels=self.labels,
+            file_label=self.file_label,
+            confidences=self.confidences,
+            output_dir=self.output_dir,
+            suffix='_MM',
+        )
+        self.saved_output_path = output_path
+        messagebox.showinfo('保存完成', f'已保存：\n{output_path}', parent=self.master)
+        self.master.destroy()
 
 if __name__ == "__main__" :
 
